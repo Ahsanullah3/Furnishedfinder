@@ -4,9 +4,7 @@ import json
 import re
 import time
 import logging
-import threading
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -24,12 +22,12 @@ SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "Sheet1")
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))
-CONCURRENCY = int(os.environ.get("CONCURRENCY", "2"))   # keep low: Chrome is heavy
+TABS = int(os.environ.get("TABS", "3"))              # parallel tabs in one Chrome
 BATCH_INDEX = int(os.environ.get("BATCH_INDEX", "0"))
 AUTO_CHAIN = os.environ.get("AUTO_CHAIN", "true").lower() == "true"
 PAGE_LOAD_TIMEOUT = int(os.environ.get("PAGE_LOAD_TIMEOUT", "45"))
-CHALLENGE_WAIT = int(os.environ.get("CHALLENGE_WAIT", "20"))  # seconds to wait for CF to resolve
-POLITE_DELAY = float(os.environ.get("POLITE_DELAY", "2.0"))
+CHALLENGE_WAIT = int(os.environ.get("CHALLENGE_WAIT", "20"))
+POLITE_DELAY = float(os.environ.get("POLITE_DELAY", "1.0"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
 
 SCOPES = [
@@ -67,7 +65,7 @@ OUT_RANGE_ROW = f"{OUT_START_LETTER}{{row}}:{OUT_END_LETTER}{{row}}"
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
-    format="%(asctime)s | %(levelname)-7s | %(threadName)-14s | %(message)s",
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
     stream=sys.stdout,
 )
@@ -106,7 +104,7 @@ def read_urls(ws) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Parsing (same selectors as before — FurnishedFinder property pages are SSR)
+# Parsing (same as before)
 # ---------------------------------------------------------------------------
 def extract_next_data(html: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
@@ -203,15 +201,12 @@ def extract_property_id(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Headless Chrome (thread-local driver — undetected_chromedriver is not thread-safe)
+# One Chrome, N tabs
 # ---------------------------------------------------------------------------
-_thread_local = threading.local()
-
-
-def _make_driver():
+def make_driver():
     options = uc.ChromeOptions()
     if HEADLESS:
-        options.add_argument("--headless=new")   # 'new' headless is far less detectable than legacy
+        options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -220,22 +215,12 @@ def _make_driver():
     options.add_argument("--lang=en-US,en")
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
-
     driver = uc.Chrome(options=options, version_main=None)
     driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     return driver
 
 
-def _get_driver():
-    d = getattr(_thread_local, "driver", None)
-    if d is None:
-        log.info("[%s] Launching headless Chrome…", threading.current_thread().name)
-        d = _make_driver()
-        _thread_local.driver = d
-    return d
-
-
-def _is_challenge_page(html: str) -> bool:
+def is_challenge_page(html: str) -> bool:
     lower = html.lower()
     return (
         "just a moment" in lower
@@ -245,59 +230,66 @@ def _is_challenge_page(html: str) -> bool:
     )
 
 
-def _wait_for_real_page(driver, url: str) -> str:
-    """Navigate, wait out any Cloudflare challenge, return final HTML."""
+def load_url_in_tab(driver, handle: str, url: str) -> str:
+    """Switch to tab `handle`, navigate, wait out challenge, return final HTML."""
+    driver.switch_to.window(handle)
     driver.get(url)
 
-    # Give Cloudflare's JS challenge time to auto-resolve.
     deadline = time.time() + CHALLENGE_WAIT
     while time.time() < deadline:
         html = driver.page_source
-        if not _is_challenge_page(html):
+        if not is_challenge_page(html):
             break
         time.sleep(2)
 
-    # Final check
     html = driver.page_source
-    if _is_challenge_page(html):
-        raise RuntimeError("Cloudflare challenge did not resolve within timeout")
-
-    # Give Next.js hydration a moment (property pages are SSR, but be safe)
-    try:
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-    except Exception:
-        pass
-
-    return driver.page_source
+    if is_challenge_page(html):
+        raise RuntimeError("Cloudflare challenge did not resolve")
+    return html
 
 
-def scrape_url(url: str) -> dict:
-    try:
-        driver = _get_driver()
-        html = _wait_for_real_page(driver, url)
-        row = parse_property(html)
-        row["status"] = "OK"
-    except Exception as e:
-        row = {k: "" for k in OUT_COLS}
-        row["status"] = f"ERROR: {type(e).__name__}: {e}"
-        log.warning("FAIL %s → %s", url, row["status"])
-        # Drop the driver so the next attempt gets a fresh browser
+def scrape_tabs_round(driver, work_batch: list) -> list:
+    """
+    Open len(work_batch) tabs (up to TABS), load each URL, collect HTML.
+    Returns list of (sheet_row, url, html_or_exception).
+    """
+    # Ensure we have N tab handles
+    handles = driver.window_handles
+    while len(handles) < len(work_batch):
+        driver.switch_to.window(handles[-1])
+        driver.execute_script("window.open('about:blank','_blank');")
+        handles = driver.window_handles
+
+    results = []
+    # Phase 1: fire all navigations (non-blocking-ish — driver.get blocks per tab,
+    # but Cloudflare's JS runs while we move to the next tab)
+    for i, (sheet_row, url) in enumerate(work_batch):
+        handle = handles[i]
+        driver.switch_to.window(handle)
         try:
-            _thread_local.driver.quit()
-        except Exception:
-            pass
-        _thread_local.driver = None
+            driver.get(url)
+        except Exception as e:
+            results.append((sheet_row, url, e))
+        else:
+            results.append((sheet_row, url, None))
 
-    row["property_id"] = extract_property_id(url)
-    row["scraped_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    time.sleep(POLITE_DELAY)
-    return row
+    # Phase 2: wait out challenges and grab HTML from each tab
+    final = []
+    for (sheet_row, url, nav_err) in results:
+        if nav_err is not None:
+            final.append((sheet_row, url, nav_err))
+            continue
+        try:
+            html = load_url_in_tab(driver, handles[results.index((sheet_row, url, nav_err))], url)
+            final.append((sheet_row, url, html))
+        except Exception as e:
+            final.append((sheet_row, url, e))
+
+    return final
 
 
 # ---------------------------------------------------------------------------
-# Batch runner
+# Batch runner (single Chrome, TABS parallel)
 # ---------------------------------------------------------------------------
 def run_batch(batch_index: int) -> int:
     ws = get_sheet()
@@ -307,8 +299,8 @@ def run_batch(batch_index: int) -> int:
     start = batch_index * BATCH_SIZE
     end = min(start + BATCH_SIZE, total)
 
-    log.info("Batch %d/%d | URLs %d..%d of %d | concurrency=%d | headless=%s",
-             batch_index + 1, total_batches, start + 1, end, total, CONCURRENCY, HEADLESS)
+    log.info("Batch %d/%d | URLs %d..%d of %d | tabs=%d | headless=%s",
+             batch_index + 1, total_batches, start + 1, end, total, TABS, HEADLESS)
 
     if start >= total:
         log.warning("Batch %d out of range (total=%d)", batch_index, total)
@@ -317,37 +309,79 @@ def run_batch(batch_index: int) -> int:
     work = all_urls[start:end]
     updates, ok, fail = [], 0, 0
 
-    with ThreadPoolExecutor(max_workers=CONCURRENCY, thread_name_prefix="chrome") as pool:
-        futures = {pool.submit(scrape_url, url): (sheet_row, url) for sheet_row, url in work}
-        for n, fut in enumerate(as_completed(futures), start=1):
-            sheet_row, url = futures[fut]
+    log.info("Launching Chrome…")
+    driver = make_driver()
+    log.info("Chrome ready.")
+
+    try:
+        # Process in chunks of TABS
+        for chunk_start in range(0, len(work), TABS):
+            chunk = work[chunk_start:chunk_start + TABS]
+            log.info("Processing chunk %d/%d (%d URLs)",
+                     chunk_start // TABS + 1,
+                     (len(work) + TABS - 1) // TABS,
+                     len(chunk))
+
             try:
-                data = fut.result()
+                results = scrape_tabs_round(driver, chunk)
             except Exception as e:
-                log.exception("Unhandled: %s", url)
-                data = {k: "" for k in OUT_COLS}
-                data["status"] = f"ERROR: {type(e).__name__}: {e}"
+                log.exception("Chunk failed: %s", e)
+                # Mark the whole chunk as failed, restart Chrome for next chunk
+                for sheet_row, url in chunk:
+                    data = {k: "" for k in OUT_COLS}
+                    data["status"] = f"ERROR: chunk failure: {e}"
+                    data["property_id"] = extract_property_id(url)
+                    data["scraped_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    updates.append({
+                        "range": OUT_RANGE_ROW.format(row=sheet_row),
+                        "values": [[str(data.get(c, "") or "") for c in OUT_COLS]],
+                    })
+                    fail += 1
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                log.info("Restarting Chrome after chunk failure…")
+                driver = make_driver()
+                continue
+
+            for sheet_row, url, html_or_err in results:
+                if isinstance(html_or_err, Exception):
+                    data = {k: "" for k in OUT_COLS}
+                    data["status"] = f"ERROR: {type(html_or_err).__name__}: {html_or_err}"
+                    log.warning("FAIL %s → %s", url, data["status"])
+                    fail += 1
+                else:
+                    try:
+                        data = parse_property(html_or_err)
+                        data["status"] = "OK"
+                        ok += 1
+                    except Exception as e:
+                        data = {k: "" for k in OUT_COLS}
+                        data["status"] = f"ERROR: parse: {e}"
+                        fail += 1
+
                 data["property_id"] = extract_property_id(url)
                 data["scraped_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                updates.append({
+                    "range": OUT_RANGE_ROW.format(row=sheet_row),
+                    "values": [[str(data.get(c, "") or "") for c in OUT_COLS]],
+                })
 
-            if data.get("status") == "OK":
-                ok += 1
-            else:
-                fail += 1
+            done = min(chunk_start + TABS, len(work))
+            log.info("Batch %d progress: %d/%d (ok=%d fail=%d)",
+                     batch_index + 1, done, len(work), ok, fail)
+            time.sleep(POLITE_DELAY)
 
-            record = [str(data.get(c, "") or "") for c in OUT_COLS]
-            updates.append({"range": OUT_RANGE_ROW.format(row=sheet_row), "values": [record]})
-
-            if n % 2 == 0 or n == len(futures):
-                log.info("Batch %d progress: %d/%d (ok=%d fail=%d)",
-                         batch_index + 1, n, len(futures), ok, fail)
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
     log.info("Writing %d rows to %s:%s", len(updates), OUT_START_LETTER, OUT_END_LETTER)
     ws.batch_update(updates, value_input_option="RAW")
     log.info("Batch %d DONE. ok=%d fail=%d", batch_index + 1, ok, fail)
-
-    # Clean up drivers created in worker threads
-    # (they live in thread-local storage which vanishes with the pool)
     return len(updates)
 
 
@@ -378,15 +412,15 @@ def trigger_next_batch(next_index: int) -> None:
 # Entrypoint
 # ---------------------------------------------------------------------------
 def main():
-    log.info("=== Scraper start | batch=%d size=%d concurrency=%d headless=%s ===",
-             BATCH_INDEX, BATCH_SIZE, CONCURRENCY, HEADLESS)
+    log.info("=== Scraper start | batch=%d size=%d tabs=%d headless=%s ===",
+             BATCH_INDEX, BATCH_SIZE, TABS, HEADLESS)
     log.info("Input:  %s!%s%d", WORKSHEET_NAME, URL_COLUMN, URL_START_ROW)
     log.info("Output: %s!%s:%s", WORKSHEET_NAME, OUT_START_LETTER, OUT_END_LETTER)
 
     ws = get_sheet()
     total = len(read_urls(ws))
     if total == 0:
-        log.warning("No URLs found. Add URLs in column A starting row 2.")
+        log.warning("No URLs found.")
         return
     total_batches = max(1, (total + BATCH_SIZE - 1) // BATCH_SIZE)
 
