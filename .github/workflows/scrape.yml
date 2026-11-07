@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       batch_index:
-        description: "Batch index (0-based). Leave 0 to start from the beginning."
+        description: "Batch index (0-based)"
         required: false
         default: "0"
       auto_chain:
-        description: "Auto-trigger the next batch when this one finishes."
+        description: "Auto-trigger next batch"
         required: false
         default: "true"
         type: choice
@@ -27,7 +27,7 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -39,15 +39,29 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Start FlareSolverr
+        run: |
+          docker run -d --name flaresolverr -p 8191:8191 flaresolverr/flaresolverr
+          echo "Waiting for FlareSolverr..."
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:8191/health | grep -q '"ok"'; then
+              echo "FlareSolverr ready"
+              break
+            fi
+            sleep 2
+          done
+
       - name: Run scraper
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           WORKSHEET_NAME: Sheet1
           BATCH_SIZE: "100"
-          CONCURRENCY: "30"
+          CONCURRENCY: "5"
           BATCH_INDEX: ${{ github.event.inputs.batch_index || '0' }}
           AUTO_CHAIN: ${{ github.event.inputs.auto_chain || 'true' }}
+          USE_FLARESOLVERR: "true"
+          FLARESOLVERR_URL: "http://localhost:8191/v1"
           LOG_LEVEL: INFO
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           GITHUB_WORKFLOW_FILE: scrape.yml
