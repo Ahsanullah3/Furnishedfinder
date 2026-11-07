@@ -36,14 +36,34 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install Chrome dependencies
+      - name: Install Chrome and dependencies
         run: |
           sudo apt-get update
+          # Ubuntu 24.04 renamed libasound2 → libasound2t64
           sudo apt-get install -y \
-            libnss3 libx11-xcb1 libxcb-dri3-0 libdrm2 \
-            libgbm1 libasound2 libatk-bridge2.0-0 libgtk-3-0
+            wget \
+            libnss3 \
+            libx11-xcb1 \
+            libxcb-dri3-0 \
+            libdrm2 \
+            libgbm1 \
+            libasound2t64 \
+            libatk-bridge2.0-0t64 \
+            libgtk-3-0t64 \
+            libatk1.0-0t64 \
+            libcups2t64 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            libxkbcommon0 \
+            libpango-1.0-0 \
+            libcairo2
+          # Install Chrome directly from Google (more reliable than apt package)
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+          google-chrome --version
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: pip install -r requirements.txt
 
       - name: Run scraper
