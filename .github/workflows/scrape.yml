@@ -1,0 +1,27 @@
+name: Scrape FurnishedFinder
+
+on:
+  workflow_dispatch:        # manual trigger
+  schedule:
+    - cron: "0 6 * * *"     # daily 06:00 UTC (remove if not wanted)
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          WORKSHEET_NAME: Properties
+        run: python scraper.py
