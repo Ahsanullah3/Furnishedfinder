@@ -8,17 +8,14 @@ import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from curl_cffi import requests as curl_requests
-import requests
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
+import requests
 
 # ---------------------------------------------------------------------------
 # Config
@@ -27,26 +24,22 @@ SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "Sheet1")
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))
-CONCURRENCY = int(os.environ.get("CONCURRENCY", "5"))          # lowered for FlareSolverr
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "2"))   # keep low: Chrome is heavy
 BATCH_INDEX = int(os.environ.get("BATCH_INDEX", "0"))
 AUTO_CHAIN = os.environ.get("AUTO_CHAIN", "true").lower() == "true"
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
-POLITE_DELAY = float(os.environ.get("POLITE_DELAY", "1.0"))
-
-# FlareSolverr endpoint (runs inside the GitHub Actions job)
-FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://localhost:8191/v1")
-USE_FLARESOLVERR = os.environ.get("USE_FLARESOLVERR", "true").lower() == "true"
+PAGE_LOAD_TIMEOUT = int(os.environ.get("PAGE_LOAD_TIMEOUT", "45"))
+CHALLENGE_WAIT = int(os.environ.get("CHALLENGE_WAIT", "20"))  # seconds to wait for CF to resolve
+POLITE_DELAY = float(os.environ.get("POLITE_DELAY", "2.0"))
+HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Input: Sheet1 column A, starting row 2
 URL_COLUMN = "A"
 URL_START_ROW = 2
 
-# Output: 14 fields starting at column O (O..AB)
 OUT_COLS = [
     "property_id", "title", "price", "bedrooms", "bathrooms", "location",
     "landlord_name", "landlord_tenure", "email_verified", "phone_verified",
@@ -81,6 +74,7 @@ logging.basicConfig(
 log = logging.getLogger("ff-scraper")
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("gspread").setLevel(logging.WARNING)
+logging.getLogger("selenium").setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +106,7 @@ def read_urls(ws) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Parsing
+# Parsing (same selectors as before — FurnishedFinder property pages are SSR)
 # ---------------------------------------------------------------------------
 def extract_next_data(html: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
@@ -209,82 +203,92 @@ def extract_property_id(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# HTTP fetch: curl_cffi first, FlareSolverr fallback on block
+# Headless Chrome (thread-local driver — undetected_chromedriver is not thread-safe)
 # ---------------------------------------------------------------------------
 _thread_local = threading.local()
 
 
-def _get_session():
-    s = getattr(_thread_local, "session", None)
-    if s is None:
-        s = curl_requests.Session()
-        _thread_local.session = s
-    return s
+def _make_driver():
+    options = uc.ChromeOptions()
+    if HEADLESS:
+        options.add_argument("--headless=new")   # 'new' headless is far less detectable than legacy
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--lang=en-US,en")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+
+    driver = uc.Chrome(options=options, version_main=None)
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    return driver
 
 
-def _looks_blocked(html: str) -> bool:
+def _get_driver():
+    d = getattr(_thread_local, "driver", None)
+    if d is None:
+        log.info("[%s] Launching headless Chrome…", threading.current_thread().name)
+        d = _make_driver()
+        _thread_local.driver = d
+    return d
+
+
+def _is_challenge_page(html: str) -> bool:
+    lower = html.lower()
     return (
-        "__NEXT_DATA__" not in html
-        or "Just a moment" in html
-        or "cf-challenge" in html.lower()
-        or "Attention Required" in html
+        "just a moment" in lower
+        or "cf-challenge" in lower
+        or "attention required" in lower
+        or ("cloudflare" in lower and "__next_data__" not in lower)
     )
 
 
-def _fetch_via_curl_cffi(url: str) -> str:
-    session = _get_session()
-    r = session.get(url, impersonate="chrome", timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    if _looks_blocked(r.text):
-        raise RuntimeError("curl_cffi blocked (challenge page)")
-    return r.text
+def _wait_for_real_page(driver, url: str) -> str:
+    """Navigate, wait out any Cloudflare challenge, return final HTML."""
+    driver.get(url)
 
+    # Give Cloudflare's JS challenge time to auto-resolve.
+    deadline = time.time() + CHALLENGE_WAIT
+    while time.time() < deadline:
+        html = driver.page_source
+        if not _is_challenge_page(html):
+            break
+        time.sleep(2)
 
-def _fetch_via_flaresolverr(url: str) -> str:
-    if not USE_FLARESOLVERR:
-        raise RuntimeError("FlareSolverr disabled")
-    payload = {
-        "cmd": "request.get",
-        "url": url,
-        "maxTimeout": REQUEST_TIMEOUT * 1000,
-    }
-    log.info("FlareSolverr solving: %s", url)
-    r = requests.post(FLARESOLVERR_URL, json=payload, timeout=REQUEST_TIMEOUT + 30)
-    data = r.json()
-    if data.get("status") != "ok":
-        raise RuntimeError(f"FlareSolverr failed: {data.get('message')}")
-    html = data.get("solution", {}).get("response", "")
-    if _looks_blocked(html):
-        raise RuntimeError("FlareSolverr returned blocked page")
-    log.info("FlareSolverr solved: %s", url)
-    return html
+    # Final check
+    html = driver.page_source
+    if _is_challenge_page(html):
+        raise RuntimeError("Cloudflare challenge did not resolve within timeout")
 
-
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    reraise=True,
-)
-def _fetch(url: str) -> str:
-    # Try fast path first
+    # Give Next.js hydration a moment (property pages are SSR, but be safe)
     try:
-        return _fetch_via_curl_cffi(url)
-    except Exception as e:
-        log.debug("curl_cffi failed for %s: %s — escalating to FlareSolverr", url, e)
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+    except Exception:
+        pass
 
-    # Escalate to browser-based solver
-    return _fetch_via_flaresolverr(url)
+    return driver.page_source
 
 
 def scrape_url(url: str) -> dict:
     try:
-        html = _fetch(url)
+        driver = _get_driver()
+        html = _wait_for_real_page(driver, url)
         row = parse_property(html)
         row["status"] = "OK"
     except Exception as e:
         row = {k: "" for k in OUT_COLS}
         row["status"] = f"ERROR: {type(e).__name__}: {e}"
         log.warning("FAIL %s → %s", url, row["status"])
+        # Drop the driver so the next attempt gets a fresh browser
+        try:
+            _thread_local.driver.quit()
+        except Exception:
+            pass
+        _thread_local.driver = None
 
     row["property_id"] = extract_property_id(url)
     row["scraped_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -303,8 +307,8 @@ def run_batch(batch_index: int) -> int:
     start = batch_index * BATCH_SIZE
     end = min(start + BATCH_SIZE, total)
 
-    log.info("Batch %d/%d | URLs %d..%d of %d | concurrency=%d",
-             batch_index + 1, total_batches, start + 1, end, total, CONCURRENCY)
+    log.info("Batch %d/%d | URLs %d..%d of %d | concurrency=%d | headless=%s",
+             batch_index + 1, total_batches, start + 1, end, total, CONCURRENCY, HEADLESS)
 
     if start >= total:
         log.warning("Batch %d out of range (total=%d)", batch_index, total)
@@ -313,7 +317,7 @@ def run_batch(batch_index: int) -> int:
     work = all_urls[start:end]
     updates, ok, fail = [], 0, 0
 
-    with ThreadPoolExecutor(max_workers=CONCURRENCY, thread_name_prefix="w") as pool:
+    with ThreadPoolExecutor(max_workers=CONCURRENCY, thread_name_prefix="chrome") as pool:
         futures = {pool.submit(scrape_url, url): (sheet_row, url) for sheet_row, url in work}
         for n, fut in enumerate(as_completed(futures), start=1):
             sheet_row, url = futures[fut]
@@ -334,13 +338,16 @@ def run_batch(batch_index: int) -> int:
             record = [str(data.get(c, "") or "") for c in OUT_COLS]
             updates.append({"range": OUT_RANGE_ROW.format(row=sheet_row), "values": [record]})
 
-            if n % 5 == 0 or n == len(futures):
+            if n % 2 == 0 or n == len(futures):
                 log.info("Batch %d progress: %d/%d (ok=%d fail=%d)",
                          batch_index + 1, n, len(futures), ok, fail)
 
     log.info("Writing %d rows to %s:%s", len(updates), OUT_START_LETTER, OUT_END_LETTER)
     ws.batch_update(updates, value_input_option="RAW")
     log.info("Batch %d DONE. ok=%d fail=%d", batch_index + 1, ok, fail)
+
+    # Clean up drivers created in worker threads
+    # (they live in thread-local storage which vanishes with the pool)
     return len(updates)
 
 
@@ -371,8 +378,8 @@ def trigger_next_batch(next_index: int) -> None:
 # Entrypoint
 # ---------------------------------------------------------------------------
 def main():
-    log.info("=== Scraper start | batch=%d size=%d concurrency=%d flaresolverr=%s ===",
-             BATCH_INDEX, BATCH_SIZE, CONCURRENCY, USE_FLARESOLVERR)
+    log.info("=== Scraper start | batch=%d size=%d concurrency=%d headless=%s ===",
+             BATCH_INDEX, BATCH_SIZE, CONCURRENCY, HEADLESS)
     log.info("Input:  %s!%s%d", WORKSHEET_NAME, URL_COLUMN, URL_START_ROW)
     log.info("Output: %s!%s:%s", WORKSHEET_NAME, OUT_START_LETTER, OUT_END_LETTER)
 
