@@ -23,25 +23,59 @@ from tenacity import (
 # Config
 # ---------------------------------------------------------------------------
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
-WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "Properties")
+WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "Sheet1")
 
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))       # URLs per batch
-CONCURRENCY = int(os.environ.get("CONCURRENCY", "30"))      # parallel workers
-BATCH_INDEX = int(os.environ.get("BATCH_INDEX", "0"))       # which batch to run
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "30"))
+BATCH_INDEX = int(os.environ.get("BATCH_INDEX", "0"))
 AUTO_CHAIN = os.environ.get("AUTO_CHAIN", "true").lower() == "true"
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
-POLITE_DELAY = float(os.environ.get("POLITE_DELAY", "0.3")) # per-worker sleep
+POLITE_DELAY = float(os.environ.get("POLITE_DELAY", "0.3"))
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
+# Input: URLs live in Sheet1 column A, starting at A2.
+URL_COLUMN = "A"
+URL_START_ROW = 2
+
+# Output: 14 fields written starting at O2 (O..AB).
 OUT_COLS = [
-    "property_id", "title", "price", "bedrooms", "bathrooms", "location",
-    "landlord_name", "landlord_tenure", "email_verified", "phone_verified",
-    "id_verified", "about", "status", "scraped_at",
+    "property_id",       # O
+    "title",             # P
+    "price",             # Q
+    "bedrooms",          # R
+    "bathrooms",         # S
+    "location",          # T
+    "landlord_name",     # U
+    "landlord_tenure",   # V
+    "email_verified",    # W
+    "phone_verified",    # X
+    "id_verified",       # Y
+    "about",             # Z
+    "status",            # AA
+    "scraped_at",        # AB
 ]
+
+# Derived: output range is O..AB = columns 15..28
+OUT_START_COL_IDX = 15   # O = 15th column (1-based)
+OUT_END_COL_IDX = OUT_START_COL_IDX + len(OUT_COLS) - 1  # 28 = AB
+
+
+def col_letter(n: int) -> str:
+    """1-based column index → spreadsheet letter (1→A, 27→AA, 28→AB)."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+OUT_START_LETTER = col_letter(OUT_START_COL_IDX)   # "O"
+OUT_END_LETTER = col_letter(OUT_END_COL_IDX)       # "AB"
+OUT_RANGE_ROW = f"{OUT_START_LETTER}{{row}}:{OUT_END_LETTER}{{row}}"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -55,8 +89,6 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("ff-scraper")
-
-# Suppress noisy third-party loggers
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("gspread").setLevel(logging.WARNING)
 
@@ -73,9 +105,26 @@ def get_sheet():
     try:
         ws = sh.worksheet(WORKSHEET_NAME)
     except gspread.WorksheetNotFound:
-        log.warning("Worksheet %r not found — creating it", WORKSHEET_NAME)
-        ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=1000, cols=20)
+        raise SystemExit(
+            f"Worksheet {WORKSHEET_NAME!r} not found. "
+            f"Create the tab (or set WORKSHEET_NAME env var) and re-run."
+        )
     return ws
+
+
+def read_urls(ws) -> list:
+    """Return [(sheet_row, url), ...] from column A starting at A2."""
+    col_values = ws.col_values(1)  # column A
+    urls = []
+    for i, val in enumerate(col_values, start=1):  # 1-based row number
+        if i < URL_START_ROW:
+            continue
+        url = (val or "").strip()
+        if url:
+            urls.append((i, url))
+    log.info("Read %d URLs from %s!%s%d:%s", len(urls),
+             ws.title, URL_COLUMN, URL_START_ROW, URL_COLUMN)
+    return urls
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +230,7 @@ def extract_property_id(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# HTTP fetch (one session per thread — curl_cffi sessions aren't thread-safe)
+# HTTP fetch (one session per thread)
 # ---------------------------------------------------------------------------
 _thread_local = threading.local()
 
@@ -231,40 +280,24 @@ def scrape_url(url: str) -> dict:
 # Batch orchestration
 # ---------------------------------------------------------------------------
 def run_batch(batch_index: int) -> int:
-    """Scrape one batch. Returns number of rows written."""
     ws = get_sheet()
-    values = ws.get_all_values()
-    if not values:
-        raise SystemExit("Sheet is empty; add the header + URLs first.")
-
-    header = values[0]
-    if "url" not in header:
-        raise SystemExit(f"Header missing 'url' column: {header}")
-    url_col = header.index("url")
-    rows = values[1:]
-
-    total = len(rows)
+    all_urls = read_urls(ws)          # [(sheet_row, url), ...] from A2 on
+    total = len(all_urls)
     total_batches = max(1, (total + BATCH_SIZE - 1) // BATCH_SIZE)
     start = batch_index * BATCH_SIZE
     end = min(start + BATCH_SIZE, total)
 
     log.info(
-        "Batch %d/%d | rows %d..%d of %d | concurrency=%d",
-        batch_index + 1, total_batches, start + 2, end + 1, total, CONCURRENCY,
+        "Batch %d/%d | URLs %d..%d of %d | concurrency=%d | output=%s",
+        batch_index + 1, total_batches, start + 1, end, total, CONCURRENCY,
+        f"{OUT_START_LETTER}:{OUT_END_LETTER}",
     )
 
     if start >= total:
         log.warning("Batch %d is out of range (total=%d). Nothing to do.", batch_index, total)
         return 0
 
-    # Collect (sheet_row, url) pairs for this batch
-    work = []
-    for i in range(start, end):
-        row = rows[i]
-        url = row[url_col].strip() if len(row) > url_col else ""
-        if url:
-            work.append((i + 2, url))   # +2 → sheet row number
-
+    work = all_urls[start:end]
     if not work:
         log.warning("Batch %d has no URLs.", batch_index)
         return 0
@@ -291,20 +324,24 @@ def run_batch(batch_index: int) -> int:
                 fail += 1
 
             record = [str(data.get(c, "") or "") for c in OUT_COLS]
-            updates.append({"range": f"B{sheet_row}:O{sheet_row}", "values": [record]})
+            updates.append({
+                "range": OUT_RANGE_ROW.format(row=sheet_row),
+                "values": [record],
+            })
 
             if n % 10 == 0 or n == len(futures):
                 log.info("Batch %d progress: %d/%d (ok=%d fail=%d)",
                          batch_index + 1, n, len(futures), ok, fail)
 
-    log.info("Batch %d writing %d rows to sheet…", batch_index + 1, len(updates))
+    log.info("Batch %d writing %d rows to %s…",
+             batch_index + 1, len(updates), f"{OUT_START_LETTER}:{OUT_END_LETTER}")
     ws.batch_update(updates, value_input_option="RAW")
     log.info("Batch %d DONE. ok=%d fail=%d", batch_index + 1, ok, fail)
     return len(updates)
 
 
 # ---------------------------------------------------------------------------
-# Auto-chain: trigger the next batch via GitHub API
+# Auto-chain
 # ---------------------------------------------------------------------------
 def trigger_next_batch(next_index: int) -> None:
     token = os.environ.get("GITHUB_TOKEN")
@@ -331,8 +368,9 @@ def trigger_next_batch(next_index: int) -> None:
     }
 
     log.info("Triggering next batch: index=%d via %s", next_index, url)
-    r = curl_requests.post(url, headers=headers, json=payload, impersonate="chrome", timeout=30)
-    if r.status_code in (204, 200):
+    r = curl_requests.post(url, headers=headers, json=payload,
+                           impersonate="chrome", timeout=30)
+    if r.status_code in (200, 204):
         log.info("Next batch triggered successfully.")
     else:
         log.error("Failed to trigger next batch: %s %s", r.status_code, r.text[:300])
@@ -342,12 +380,21 @@ def trigger_next_batch(next_index: int) -> None:
 # Entrypoint
 # ---------------------------------------------------------------------------
 def main():
-    log.info("=== Scraper start | batch_index=%d batch_size=%d concurrency=%d auto_chain=%s ===",
-             BATCH_INDEX, BATCH_SIZE, CONCURRENCY, AUTO_CHAIN)
+    log.info(
+        "=== Scraper start | batch_index=%d batch_size=%d concurrency=%d auto_chain=%s ===",
+        BATCH_INDEX, BATCH_SIZE, CONCURRENCY, AUTO_CHAIN,
+    )
+    log.info("Input:  %s!%s%d → end of column", WORKSHEET_NAME, URL_COLUMN, URL_START_ROW)
+    log.info("Output: %s!%s2:%s (14 fields)", WORKSHEET_NAME, OUT_START_LETTER, OUT_END_LETTER)
 
     ws = get_sheet()
-    total = len(ws.get_all_values()) - 1  # minus header
+    total = len(read_urls(ws))
     total_batches = max(1, (total + BATCH_SIZE - 1) // BATCH_SIZE)
+
+    if total == 0:
+        log.warning("No URLs found in %s!%s%d. Add URLs and re-run.",
+                    WORKSHEET_NAME, URL_COLUMN, URL_START_ROW)
+        return
 
     written = run_batch(BATCH_INDEX)
 
