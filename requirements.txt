@@ -3,3 +3,4 @@ beautifulsoup4==4.12.3
 lxml==5.2.2
 gspread==6.1.2
 google-auth==2.32.0
+tenacity==8.5.0
