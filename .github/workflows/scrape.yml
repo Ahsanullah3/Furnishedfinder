@@ -1,9 +1,9 @@
 name: Scrape FurnishedFinder
 
 on:
-  workflow_dispatch:        # manual trigger
+  workflow_dispatch:
   schedule:
-    - cron: "0 6 * * *"     # daily 06:00 UTC (remove if not wanted)
+    - cron: "0 6 * * *"   # daily 06:00 UTC; remove if you only want manual runs
 
 jobs:
   scrape:
@@ -17,7 +17,8 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
       - name: Run scraper
         env:
