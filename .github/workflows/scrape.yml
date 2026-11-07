@@ -2,13 +2,34 @@ name: Scrape FurnishedFinder
 
 on:
   workflow_dispatch:
+    inputs:
+      batch_index:
+        description: "Batch index (0-based). Leave 0 to start from the beginning."
+        required: false
+        default: "0"
+      auto_chain:
+        description: "Auto-trigger the next batch when this one finishes."
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
   schedule:
     - cron: "0 6 * * *"   # daily 06:00 UTC; remove if you only want manual runs
+
+# Required so the workflow can trigger itself via the API
+permissions:
+  actions: write
+  contents: read
+
+# Prevent overlapping runs of the same batch
+concurrency:
+  group: ff-scrape-${{ github.event.inputs.batch_index || '0' }}
+  cancel-in-progress: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -25,4 +46,12 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           WORKSHEET_NAME: Properties
+          BATCH_SIZE: "100"
+          CONCURRENCY: "30"
+          BATCH_INDEX: ${{ github.event.inputs.batch_index || '0' }}
+          AUTO_CHAIN: ${{ github.event.inputs.auto_chain || 'true' }}
+          LOG_LEVEL: INFO
+          # Used by trigger_next_batch() to dispatch the next run
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_WORKFLOW_FILE: scrape.yml
         run: python scraper.py
