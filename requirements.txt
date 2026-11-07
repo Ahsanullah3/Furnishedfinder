@@ -1,7 +1,7 @@
-curl_cffi==0.7.4
+undetected-chromedriver==3.5.5
+selenium==4.25.0
 beautifulsoup4==4.12.3
 lxml==5.2.2
 gspread==6.1.2
 google-auth==2.32.0
-tenacity==8.5.0
 requests==2.32.3
